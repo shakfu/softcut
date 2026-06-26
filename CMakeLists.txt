@@ -36,6 +36,9 @@ target_compile_definitions(_core PRIVATE MA_NO_DECODING MA_NO_ENCODING)
 
 if(MSVC)
     target_compile_options(_core PRIVATE /W4)
+    # MSVC's <cmath> only defines M_PI/M_PI_2 (used by the vendored DSP sources)
+    # when _USE_MATH_DEFINES is set before the header is included.
+    target_compile_definitions(_core PRIVATE _USE_MATH_DEFINES)
 else()
     target_compile_options(_core PRIVATE -Wall -Wextra)
 endif()
