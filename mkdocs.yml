@@ -1,0 +1,55 @@
+site_name: softcut
+site_description: Python bindings for softcut-lib with realtime audio I/O
+repo_url: https://github.com/shakfu/softcut-py
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Concepts: concepts.md
+  - Guide:
+      - Live looping: guide/live-looping.md
+      - Offline rendering: guide/offline-rendering.md
+      - Routing & feedback: guide/routing.md
+      - Devices: guide/devices.md
+      - Realtime parameters: guide/realtime.md
+  - Demos: demos.md
+  - API reference: api.md
+  - Changelog: changelog.md

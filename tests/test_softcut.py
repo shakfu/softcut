@@ -403,6 +403,97 @@ def test_engine_sync():
     eng.sync(follow=1, lead=0, offset=0.0)  # should not raise
 
 
+# --- Routing, feedback, and devices --------------------------------------
+
+
+def _recording_voice(eng, vi, sr, n):
+    buf = np.zeros(n, dtype=np.float32)
+    v = eng[vi]
+    v.buffer = buf
+    v.configure(
+        loop_region=(0, n / sr), rate=1.0, rec_level=1.0, pre_level=0.0, fade_time=0.001
+    )
+    v.rec = True
+    v.play = True
+    v.cut_to(0.0)
+    return buf
+
+
+def test_input_gain_default_and_roundtrip():
+    v = Voice(SR)
+    assert v.input_gain == pytest.approx(1.0)
+    v.input_gain = 0.25
+    assert v.input_gain == pytest.approx(0.25)
+
+
+def test_input_gain_scales_external_input():
+    sr, n = 48000, 65536
+    eng = Engine(voices=1, sample_rate=sr, mode="playback")
+    buf = _recording_voice(eng, 0, sr, n)
+
+    eng[0].input_gain = 0.0  # gate the input off
+    eng.render(np.full(8192, 0.5, dtype=np.float32))
+    assert np.abs(buf).sum() == 0.0
+
+    buf[:] = 0.0
+    eng[0].input_gain = 1.0
+    eng[0].cut_to(0.0)
+    eng.render(np.full(8192, 0.5, dtype=np.float32))
+    assert np.abs(buf).sum() > 0.0
+
+
+def test_feedback_default_zero_and_roundtrip():
+    eng = Engine(voices=2, mode="playback")
+    assert eng.feedback(0, 1) == pytest.approx(0.0)
+    assert eng.feedback(1, 0, 0.5) is eng  # setter returns self
+    assert eng.feedback(1, 0) == pytest.approx(0.5)
+
+
+def test_feedback_routes_one_voice_into_another():
+    sr, n = 48000, 65536
+    eng = Engine(voices=2, sample_rate=sr, mode="playback")
+    # voice 0 plays a tone
+    eng[0].buffer = (0.5 * np.sin(2 * np.pi * 200 * np.arange(n) / sr)).astype(
+        np.float32
+    )
+    eng[0].configure(loop_region=(0, n / sr), rate=1.0)
+    eng[0].play = True
+    eng[0].cut_to(0.0)
+    # voice 1 records whatever reaches its input (external is silent here)
+    buf1 = _recording_voice(eng, 1, sr, n)
+
+    eng.render(np.zeros(8192, dtype=np.float32))
+    assert np.abs(buf1).sum() == 0.0  # no feedback yet -> nothing to record
+
+    eng.feedback(0, 1, 1.0)
+    eng.render(np.zeros(8192, dtype=np.float32))
+    assert np.abs(buf1).sum() > 0.0  # voice 0's output recorded into voice 1
+
+
+def test_feedback_index_out_of_range():
+    eng = Engine(voices=2, mode="playback")
+    with pytest.raises(Exception):
+        eng.feedback(0, 5, 1.0)
+    with pytest.raises(Exception):
+        eng.feedback(-1, 0, 1.0)
+
+
+def test_engine_accepts_device_args():
+    eng = Engine(voices=1, mode="playback", output_device=-1, input_device=-1)
+    assert len(eng) == 1
+
+
+def test_list_devices_structure():
+    try:
+        devices = softcut.list_devices()
+    except RuntimeError:
+        pytest.skip("no audio context available")
+    assert isinstance(devices, list)
+    for d in devices:
+        assert {"index", "name", "type", "is_default"} <= set(d)
+        assert d["type"] in ("playback", "capture")
+
+
 # --- Deprecated alias ----------------------------------------------------
 
 
@@ -438,3 +529,36 @@ def test_live_device_smoke():
     finally:
         eng.stop()
     assert eng.running is False
+
+
+@pytest.mark.skipif(
+    not os.environ.get("SOFTCUT_TEST_AUDIO"),
+    reason="set SOFTCUT_TEST_AUDIO=1 to exercise a real audio device",
+)
+def test_command_queue_applies_param_while_running():
+    """A param set while the device runs is applied on the audio thread."""
+    import time
+
+    sr, n = 48000, 65536
+    eng = Engine(voices=1, sample_rate=sr, mode="playback", block_size=256)
+    eng[0].buffer = (0.2 * np.sin(2 * np.pi * 200 * np.arange(n) / sr)).astype(
+        np.float32
+    )
+    eng[0].configure(loop_region=(0, n / sr), rate=1.0)
+    eng[0].play = True
+    eng[0].cut_to(0.0)
+    try:
+        eng.start()
+    except RuntimeError as e:
+        pytest.skip(f"no audio device available: {e}")
+    try:
+        time.sleep(0.05)
+        eng[0].rate = 3.0  # enqueued; applied on the audio thread
+        time.sleep(0.1)
+    finally:
+        eng.stop()  # drains any remaining commands
+
+    # the queued rate change took effect: the head now advances ~3x real time
+    p0 = eng[0].position
+    eng.render(np.zeros(int(0.1 * sr), dtype=np.float32))
+    assert eng[0].position - p0 > 0.2

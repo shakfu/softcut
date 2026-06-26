@@ -34,9 +34,21 @@ from collections.abc import Iterator, Sequence
 import numpy as np
 
 from softcut._core import Voice, _Engine
+from softcut._core import list_devices as _list_devices
 
-__all__ = ["Voice", "Engine", "Softcut", "next_power_of_two"]
+__all__ = ["Voice", "Engine", "Softcut", "next_power_of_two", "list_devices"]
 __version__ = "0.1.0"
+
+
+def list_devices() -> list[dict]:
+    """List the system audio devices.
+
+    Returns a list of dicts with keys ``index``, ``name``, ``type``
+    (``"playback"`` or ``"capture"``) and ``is_default``. The ``index`` is what
+    ``Engine(output_device=...)`` / ``Engine(input_device=...)`` expect for the
+    matching type.
+    """
+    return _list_devices()
 
 
 def next_power_of_two(n: int) -> int:
@@ -150,8 +162,10 @@ class Engine(Sequence[Voice]):
 
     ``mode`` is ``"duplex"`` (live mic input feeds recording voices and voice
     outputs go to the speakers) or ``"playback"`` (speakers only; recording is
-    from pre-loaded buffers). Routing, mixing and file I/O are otherwise left to
-    plain Python/numpy.
+    from pre-loaded buffers). ``output_device``/``input_device`` select a device
+    by its index from :func:`list_devices` (``-1`` uses the system default).
+    Voices mix to stereo via their ``level``/``pan``; ``feedback()`` routes one
+    voice's output into another's input.
     """
 
     def __init__(
@@ -161,6 +175,8 @@ class Engine(Sequence[Voice]):
         mode: str = "duplex",
         block_size: int = 512,
         out_channels: int = 2,
+        output_device: int = -1,
+        input_device: int = -1,
     ) -> None:
         if voices < 1:
             raise ValueError("voices must be >= 1")
@@ -176,6 +192,8 @@ class Engine(Sequence[Voice]):
             self._block_size,
             mode == "duplex",
             int(out_channels),
+            int(output_device),
+            int(input_device),
         )
 
     # sequence protocol
@@ -256,6 +274,18 @@ class Engine(Sequence[Voice]):
     def sync(self, follow: int, lead: int, offset: float = 0.0) -> None:
         """Cut the ``follow`` voice to the ``lead`` voice's position + offset."""
         self._voices[follow].cut_to(self._voices[lead].position + offset)
+
+    def feedback(self, src: int, dst: int, amount: float | None = None):
+        """Get or set the feedback gain from voice ``src`` into voice ``dst``.
+
+        With ``amount`` omitted, returns the current gain. Otherwise sets it (a
+        voice's output is mixed into another's input, delayed by one block) and
+        returns ``self``. ``src == dst`` is self-feedback (a delay line).
+        """
+        if amount is None:
+            return self._core.get_feedback(src, dst)
+        self._core.set_feedback(src, dst, float(amount))
+        return self
 
     def render(self, input: np.ndarray) -> np.ndarray:
         """Offline: process a mono input block through all voices.

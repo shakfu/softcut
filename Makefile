@@ -4,7 +4,7 @@
 # This Makefile wraps common build commands for convenience.
 # The actual build is handled by scikit-build-core via pyproject.toml
 
-.PHONY: all sync build rebuild test lint format typecheck qa demos demo-looper clean         distclean wheel sdist dist check publish-test publish upgrade         coverage coverage-html docs release help
+.PHONY: all sync build rebuild test lint format typecheck qa demos demo-looper clean         distclean wheel sdist dist check publish-test publish upgrade         coverage coverage-html docs docs-serve docs-deploy release help
 
 # Default target
 all: build
@@ -89,9 +89,18 @@ coverage-html:
 	@uv run pytest tests/ -v --cov=src/softcut --cov-report=html
 	@echo "Coverage report: htmlcov/index.html"
 
-# Build documentation (requires sphinx in dev dependencies)
+# Build documentation (MkDocs Material) into site/
 docs:
-	@uv run sphinx-build -b html docs/ docs/_build/html
+	@uv run --group docs mkdocs build
+
+# Serve the docs locally with live reload
+docs-serve:
+	@uv run --group docs mkdocs serve
+
+# Deploy the docs to GitHub Pages (builds and force-pushes the gh-pages branch).
+# Requires push access to the repo and Pages enabled to serve from gh-pages.
+docs-deploy:
+	@uv run --group docs mkdocs gh-deploy --force
 
 # Create a release (bump version, tag, push)
 release:
@@ -136,7 +145,9 @@ help:
 	@echo "  upgrade      - Upgrade all dependencies"
 	@echo "  coverage     - Run tests with coverage"
 	@echo "  coverage-html- Generate HTML coverage report"
-	@echo "  docs         - Build documentation with Sphinx"
+	@echo "  docs         - Build the documentation site (MkDocs) into site/"
+	@echo "  docs-serve   - Serve the docs locally with live reload"
+	@echo "  docs-deploy  - Build and publish the docs to GitHub Pages (gh-pages)"
 	@echo "  release      - Bump version, tag, and prepare release"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  distclean    - Remove all generated files"

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Voice-to-voice feedback routing: `Engine.feedback(src, dst, amount)` mixes one
+  voice's output into another's input (one block delayed; `src == dst` is a
+  self-feedback delay line), plus a per-voice `input_gain` for the engine's
+  external input.
+- Lock-free single-producer/single-consumer command queue: while the device is
+  running, voice DSP parameter changes from Python are applied on the audio
+  thread instead of racing it. Setters apply directly when no engine is running.
+- Device selection: `softcut.list_devices()` enumerates the system audio devices,
+  and `Engine(output_device=..., input_device=...)` selects one by index
+  (`-1` = system default).
+- Release engineering: GitHub Actions CI (QA plus a Linux/macOS/Windows build
+  smoke matrix) and a tag-triggered `cibuildwheel` workflow that builds wheels
+  for CPython 3.10-3.14 across Linux (x86_64/aarch64), macOS (x86_64/arm64) and
+  Windows, plus the sdist, and publishes to PyPI via trusted publishing.
+
+### Changed
+- CMake links `ole32` on Windows (COM, used by miniaudio's WASAPI backend).
+
 ## [0.1.0] - 2026-06-26
 
 ### Added

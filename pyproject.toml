@@ -1,7 +1,7 @@
 [project]
-name = "softcut"
+name = "softcut-py"
 version = "0.1.0"
-description = "Python bindings for softcut with nanobind"
+description = "Python bindings for softcut-lib (the norns softcut DSP engine) with nanobind"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
@@ -32,9 +32,13 @@ dev = [
     "ruff>=0.14.9",
     "twine>=6.2.0",
 ]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+]
 
 [build-system]
-requires = ["scikit-build-core>=0.8", "nanobind"]
+requires = ["scikit-build-core>=0.12", "nanobind"]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
@@ -63,3 +67,15 @@ sdist.exclude = [
 wheel.exclude = [
     "*.cpp",
 ]
+
+[tool.cibuildwheel]
+# CPython 3.10-3.14 (matches requires-python); skip PyPy and musllinux. The
+# `cp314-*` glob excludes free-threaded `cp314t` builds on purpose: the realtime
+# command queue is single-producer and relies on the GIL on the Python side.
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* pp*"
+build-verbosity = 1
+# Install the built wheel and run the suite on each target. numpy arrives via the
+# wheel's own dependency; live-device tests skip without SOFTCUT_TEST_AUDIO.
+test-requires = "pytest"
+test-command = "pytest {project}/tests -q"

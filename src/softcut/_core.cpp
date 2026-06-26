@@ -12,8 +12,11 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <array>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -31,6 +34,34 @@ using BufferArray = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cp
 
 namespace {
 
+// Single-producer / single-consumer lock-free ring of small commands. The
+// control thread (Python, GIL held) pushes; the audio thread drains at each
+// block. Commands are tiny lambdas (a Voice* plus a scalar) that fit in
+// std::function's small-buffer storage, so push/pop/call never touch the heap.
+struct CommandQueue {
+    static constexpr size_t CAP = 4096;  // power of two
+    std::array<std::function<void()>, CAP> buf;
+    std::atomic<size_t> head{0};  // producer writes here
+    std::atomic<size_t> tail{0};  // consumer reads here
+
+    bool push(const std::function<void()> &fn) {
+        const size_t h = head.load(std::memory_order_relaxed);
+        const size_t n = (h + 1) & (CAP - 1);
+        if (n == tail.load(std::memory_order_acquire)) return false;  // full
+        buf[h] = fn;
+        head.store(n, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(std::function<void()> &out) {
+        const size_t t = tail.load(std::memory_order_relaxed);
+        if (t == head.load(std::memory_order_acquire)) return false;  // empty
+        out = std::move(buf[t]);
+        tail.store((t + 1) & (CAP - 1), std::memory_order_release);
+        return true;
+    }
+};
+
 struct Voice {
     softcut::Voice v;
     nb::object buffer_ref;  // keepalive for the numpy array passed to setBuffer
@@ -38,8 +69,26 @@ struct Voice {
 
     // Engine mix parameters (not softcut params): read by Engine's mixer.
     // level is a linear gain; pan is -1 (left) .. 0 (center) .. +1 (right).
+    // input_gain scales the engine's external input fed into this voice.
     float level_ = 1.0f;
     float pan_ = 0.0f;
+    float input_gain_ = 1.0f;
+
+    // Set when the voice is hosted by an Engine. While the engine is running,
+    // DSP setters are applied on the audio thread via the command queue.
+    CommandQueue *cmd_queue_ = nullptr;
+    std::atomic<bool> *engine_running_ = nullptr;
+
+    // Apply a softcut DSP change now, or defer it to the audio thread if an
+    // engine is running (so the audio thread never reads a half-written param).
+    void dsp_apply(std::function<void()> fn) {
+        if (engine_running_ != nullptr &&
+            engine_running_->load(std::memory_order_acquire) &&
+            cmd_queue_->push(fn)) {
+            return;
+        }
+        fn();
+    }
 
     // Mirrors of write-only parameters, seeded with softcut::Voice::reset()
     // defaults so getters are meaningful before the first set.
@@ -123,57 +172,111 @@ struct Voice {
 // (on miniaudio's audio thread, no GIL) and the offline render() path.
 struct Engine {
     std::vector<Voice *> voices;
+    int n_voices;
     float sample_rate;
     int block_size;
     bool duplex;       // true: capture mic input; false: playback only
     int out_channels;  // device playback channels (typically 2)
+    int output_device_index;  // -1 = default device
+    int input_device_index;   // -1 = default device
 
-    std::vector<float> silence;  // zeroed mono input for playback mode / no input
-    std::vector<float> scratch;  // per-voice mono output, reused across voices
+    std::vector<float> silence;   // zeroed mono input for playback / no input
+    std::vector<float> voice_in;  // per-voice input scratch (block_size)
+    std::vector<float> fb;        // feedback matrix, fb[src*n_voices + dst]
+    std::vector<float> prev_out;  // last block's per-voice output (n*block_size)
+    std::vector<float> cur_out;   // this block's per-voice output (n*block_size)
 
+    CommandQueue queue;
+    std::atomic<bool> running{false};
+
+    ma_context context;
+    bool context_inited = false;
     ma_device device;
     bool device_inited = false;
     bool device_started = false;
 
-    Engine(std::vector<Voice *> vs, float sr, int block, bool dup, int out_ch)
-        : voices(std::move(vs)), sample_rate(sr), block_size(block),
-          duplex(dup), out_channels(out_ch) {
+    Engine(std::vector<Voice *> vs, float sr, int block, bool dup, int out_ch,
+           int out_dev, int in_dev)
+        : voices(std::move(vs)), n_voices(static_cast<int>(voices.size())),
+          sample_rate(sr), block_size(block), duplex(dup), out_channels(out_ch),
+          output_device_index(out_dev), input_device_index(in_dev) {
         if (block_size < 1) throw std::invalid_argument("block_size must be >= 1");
         if (out_channels < 1) throw std::invalid_argument("out_channels must be >= 1");
         silence.assign(block_size, 0.0f);
-        scratch.assign(block_size, 0.0f);
-        for (Voice *vp : voices) vp->set_sample_rate(sr);
-    }
-
-    ~Engine() {
-        if (device_inited) {
-            ma_device_uninit(&device);  // stops the audio thread synchronously
-            device_inited = false;
-            device_started = false;
+        voice_in.assign(block_size, 0.0f);
+        fb.assign(static_cast<size_t>(n_voices) * n_voices, 0.0f);
+        prev_out.assign(static_cast<size_t>(n_voices) * block_size, 0.0f);
+        cur_out.assign(static_cast<size_t>(n_voices) * block_size, 0.0f);
+        for (Voice *vp : voices) {
+            vp->set_sample_rate(sr);
+            vp->cmd_queue_ = &queue;
+            vp->engine_running_ = &running;
         }
     }
 
+    ~Engine() {
+        running.store(false, std::memory_order_release);
+        if (device_inited) ma_device_uninit(&device);  // joins the audio thread
+        if (context_inited) ma_context_uninit(&context);
+        for (Voice *vp : voices) {  // never leave dangling pointers into us
+            vp->cmd_queue_ = nullptr;
+            vp->engine_running_ = nullptr;
+        }
+    }
+
+    // Drain and apply any queued parameter changes. Runs on the audio thread at
+    // each block, and on the control thread once the device has stopped.
+    void drain_commands() {
+        std::function<void()> fn;
+        while (queue.pop(fn)) fn();
+    }
+
     // Process up to block_size frames of mono input into interleaved stereo
-    // output. GIL-free and allocation-free. `in` has `frames` mono samples.
-    void process_core(const float *in, float *out, int frames) {
+    // output, applying per-voice input gain and voice->voice feedback (delayed
+    // by one block). GIL-free and allocation-free.
+    void process_core(const float *ext_in, float *out, int frames) {
         for (int i = 0; i < frames * out_channels; ++i) out[i] = 0.0f;
-        for (Voice *vp : voices) {
-            vp->v.processBlockMono(in, scratch.data(), frames);
-            const float level = vp->level_;
+        for (int dst = 0; dst < n_voices; ++dst) {
+            Voice *vp = voices[dst];
+            float *vin = voice_in.data();
+            const float ig = vp->input_gain_;
+            for (int i = 0; i < frames; ++i) vin[i] = ext_in ? ext_in[i] * ig : 0.0f;
+            for (int src = 0; src < n_voices; ++src) {
+                const float g = fb[static_cast<size_t>(src) * n_voices + dst];
+                if (g == 0.0f) continue;
+                const float *po = prev_out.data() + static_cast<size_t>(src) * block_size;
+                for (int i = 0; i < frames; ++i) vin[i] += po[i] * g;
+            }
+            float *o = cur_out.data() + static_cast<size_t>(dst) * block_size;
+            vp->v.processBlockMono(vin, o, frames);
             // equal-power pan: pan -1..1 -> angle 0..pi/2
+            const float level = vp->level_;
             const float theta = (vp->pan_ * 0.5f + 0.5f) * 1.5707963267948966f;
             const float gl = level * std::cos(theta);
             const float gr = level * std::sin(theta);
             for (int f = 0; f < frames; ++f) {
-                const float s = scratch[f];
-                out[f * out_channels + 0] += s * gl;
-                if (out_channels > 1) out[f * out_channels + 1] += s * gr;
+                out[f * out_channels + 0] += o[f] * gl;
+                if (out_channels > 1) out[f * out_channels + 1] += o[f] * gr;
             }
         }
+        std::swap(prev_out, cur_out);  // this block's outputs feed the next
+    }
+
+    void set_feedback(int src, int dst, float amount) {
+        if (src < 0 || src >= n_voices || dst < 0 || dst >= n_voices)
+            throw std::out_of_range("voice index out of range");
+        fb[static_cast<size_t>(src) * n_voices + dst] = amount;
+    }
+
+    float get_feedback(int src, int dst) const {
+        if (src < 0 || src >= n_voices || dst < 0 || dst >= n_voices)
+            throw std::out_of_range("voice index out of range");
+        return fb[static_cast<size_t>(src) * n_voices + dst];
     }
 
     // Called from miniaudio's audio thread. Chunks frameCount to block_size.
     void callback_process(const float *in, float *out, int frameCount) {
+        drain_commands();
         int done = 0;
         while (done < frameCount) {
             int chunk = std::min(block_size, frameCount - done);
@@ -206,32 +309,67 @@ struct Engine {
     void start() {
         if (device_started) return;
         if (!device_inited) {
+            ma_device_id playback_id, capture_id;
+            ma_device_id *p_playback_id = nullptr;
+            ma_device_id *p_capture_id = nullptr;
+
+            // Explicit device selection requires a context to resolve ids.
+            if (output_device_index >= 0 || input_device_index >= 0) {
+                if (!context_inited) {
+                    if (ma_context_init(nullptr, 0, nullptr, &context) != MA_SUCCESS)
+                        throw std::runtime_error("failed to initialize audio context");
+                    context_inited = true;
+                }
+                ma_device_info *playback_infos, *capture_infos;
+                ma_uint32 n_playback, n_capture;
+                if (ma_context_get_devices(&context, &playback_infos, &n_playback,
+                                           &capture_infos, &n_capture) != MA_SUCCESS)
+                    throw std::runtime_error("failed to enumerate audio devices");
+                if (output_device_index >= 0) {
+                    if (output_device_index >= static_cast<int>(n_playback))
+                        throw std::invalid_argument("output_device index out of range");
+                    playback_id = playback_infos[output_device_index].id;
+                    p_playback_id = &playback_id;
+                }
+                if (duplex && input_device_index >= 0) {
+                    if (input_device_index >= static_cast<int>(n_capture))
+                        throw std::invalid_argument("input_device index out of range");
+                    capture_id = capture_infos[input_device_index].id;
+                    p_capture_id = &capture_id;
+                }
+            }
+
             ma_device_config cfg = ma_device_config_init(
                 duplex ? ma_device_type_duplex : ma_device_type_playback);
             cfg.sampleRate = static_cast<ma_uint32>(sample_rate);
             cfg.periodSizeInFrames = static_cast<ma_uint32>(block_size);
             cfg.playback.format = ma_format_f32;
             cfg.playback.channels = static_cast<ma_uint32>(out_channels);
+            cfg.playback.pDeviceID = p_playback_id;
             if (duplex) {
                 cfg.capture.format = ma_format_f32;
                 cfg.capture.channels = 1;  // miniaudio sums device channels to mono
+                cfg.capture.pDeviceID = p_capture_id;
             }
             cfg.dataCallback = &Engine::data_callback;
             cfg.pUserData = this;
-            if (ma_device_init(nullptr, &cfg, &device) != MA_SUCCESS)
+            ma_context *p_ctx = context_inited ? &context : nullptr;
+            if (ma_device_init(p_ctx, &cfg, &device) != MA_SUCCESS)
                 throw std::runtime_error("failed to initialize audio device");
             device_inited = true;
         }
         if (ma_device_start(&device) != MA_SUCCESS)
             throw std::runtime_error("failed to start audio device");
         device_started = true;
+        running.store(true, std::memory_order_release);
     }
 
     void stop() {
-        if (device_started) {
-            ma_device_stop(&device);
-            device_started = false;
-        }
+        if (!device_started) return;
+        running.store(false, std::memory_order_release);
+        ma_device_stop(&device);  // synchronous: no callback runs after this
+        drain_commands();         // apply anything queued but not yet consumed
+        device_started = false;
     }
 
     static void data_callback(ma_device *dev, void *pOutput, const void *pInput,
@@ -243,19 +381,59 @@ struct Engine {
     }
 };
 
+// Enumerate the system audio devices. Returns a list of dicts with keys
+// index/name/type/is_default; the index is what Engine(output_device=...) and
+// Engine(input_device=...) expect for the matching type.
+nb::list list_audio_devices() {
+    nb::list result;
+    ma_context ctx;
+    if (ma_context_init(nullptr, 0, nullptr, &ctx) != MA_SUCCESS)
+        throw std::runtime_error("failed to initialize audio context");
+    ma_device_info *playback_infos, *capture_infos;
+    ma_uint32 n_playback, n_capture;
+    if (ma_context_get_devices(&ctx, &playback_infos, &n_playback, &capture_infos,
+                               &n_capture) != MA_SUCCESS) {
+        ma_context_uninit(&ctx);
+        throw std::runtime_error("failed to enumerate audio devices");
+    }
+    auto add = [&](ma_device_info *infos, ma_uint32 count, const char *type) {
+        for (ma_uint32 i = 0; i < count; ++i) {
+            nb::dict d;
+            d["index"] = static_cast<int>(i);
+            d["name"] = infos[i].name;
+            d["type"] = type;
+            d["is_default"] = static_cast<bool>(infos[i].isDefault);
+            result.append(d);
+        }
+    };
+    add(playback_infos, n_playback, "playback");
+    add(capture_infos, n_capture, "capture");
+    ma_context_uninit(&ctx);
+    return result;
+}
+
 }  // namespace
 
-// float property: mirror field + forwarding setter
-#define FPROP(name, field, setter)                                    \
-    def_prop_rw(                                                       \
-        name, [](Voice &s) { return s.field; },                     \
-        [](Voice &s, float x) { s.field = x; s.v.setter(x); })
+// float property: mirror field (read immediately) + DSP setter routed through
+// the command queue when an engine is running.
+#define FPROP(name, field, setter)                                       \
+    def_prop_rw(                                                          \
+        name, [](Voice &s) { return s.field; },                          \
+        [](Voice &s, float x) {                                          \
+            s.field = x;                                                  \
+            Voice *p = &s;                                                \
+            s.dsp_apply([p, x] { p->v.setter(x); });                     \
+        })
 
 // bool property
-#define BPROP(name, field, setter)                                    \
-    def_prop_rw(                                                       \
-        name, [](Voice &s) { return s.field; },                     \
-        [](Voice &s, bool x) { s.field = x; s.v.setter(x); })
+#define BPROP(name, field, setter)                                       \
+    def_prop_rw(                                                          \
+        name, [](Voice &s) { return s.field; },                          \
+        [](Voice &s, bool x) {                                           \
+            s.field = x;                                                  \
+            Voice *p = &s;                                                \
+            s.dsp_apply([p, x] { p->v.setter(x); });                     \
+        })
 
 NB_MODULE(_core, m) {
     m.doc() = "Python binding for softcut-lib's per-voice DSP engine.";
@@ -329,6 +507,10 @@ NB_MODULE(_core, m) {
             [](Voice &s) { return s.pan_; },
             [](Voice &s, float x) { s.pan_ = x; },
             "Stereo pan, -1 (left) to +1 (right), applied by an Engine mixer.")
+        .def_prop_rw("input_gain",
+            [](Voice &s) { return s.input_gain_; },
+            [](Voice &s, float x) { s.input_gain_ = x; },
+            "Gain applied to the engine's external input fed into this voice.")
 
         // read-only state
         .def_prop_ro("position", [](Voice &s) { return s.v.getActivePosition(); },
@@ -343,11 +525,20 @@ NB_MODULE(_core, m) {
         .def("process", &Voice::process, "input"_a,
             "Process one mono block. Takes a 1-D float32 numpy array of input "
             "samples and returns a new float32 array of the same length.")
-        .def("cut_to", [](Voice &s, float sec) { s.v.cutToPos(sec); }, "sec"_a,
+        .def("cut_to", [](Voice &s, float sec) {
+                Voice *p = &s;
+                s.dsp_apply([p, sec] { p->v.cutToPos(sec); });
+            }, "sec"_a,
             "Jump the head to the given position in seconds (with a crossfade).")
-        .def("stop", [](Voice &s) { s.v.stop(); },
+        .def("stop", [](Voice &s) {
+                Voice *p = &s;
+                s.dsp_apply([p] { p->v.stop(); });
+            },
             "Immediately stop both subheads.")
-        .def("reset", [](Voice &s) { s.v.reset(); },
+        .def("reset", [](Voice &s) {
+                Voice *p = &s;
+                s.dsp_apply([p] { p->v.reset(); });
+            },
             "Reset the voice's DSP state to defaults.");
 
     // Low-level realtime host. The Python-facing facade (softcut.Engine) wraps
@@ -356,8 +547,9 @@ NB_MODULE(_core, m) {
     nb::class_<Engine>(m, "_Engine",
         "Low-level multi-voice realtime host over a miniaudio device. Use the "
         "softcut.Engine facade instead.")
-        .def(nb::init<std::vector<Voice *>, float, int, bool, int>(),
+        .def(nb::init<std::vector<Voice *>, float, int, bool, int, int, int>(),
             "voices"_a, "sample_rate"_a, "block_size"_a, "duplex"_a, "out_channels"_a,
+            "output_device"_a, "input_device"_a,
             nb::keep_alive<1, 2>())
         .def("start", &Engine::start, nb::call_guard<nb::gil_scoped_release>(),
             "Open (if needed) and start the audio device. Non-blocking.")
@@ -367,9 +559,17 @@ NB_MODULE(_core, m) {
             "Offline: process a 1-D float32 mono input array through all voices "
             "and return an (n, out_channels) float32 array. Do not call while "
             "the device is running.")
+        .def("set_feedback", &Engine::set_feedback, "src"_a, "dst"_a, "amount"_a,
+            "Set the feedback gain from voice src's output into voice dst's input.")
+        .def("get_feedback", &Engine::get_feedback, "src"_a, "dst"_a,
+            "Get the feedback gain from voice src into voice dst.")
         .def_prop_ro("running", [](Engine &e) { return e.device_started; },
             "True while the audio device is started.")
         .def_prop_ro("block_size", [](Engine &e) { return e.block_size; })
         .def_prop_ro("out_channels", [](Engine &e) { return e.out_channels; })
         .def_prop_ro("duplex", [](Engine &e) { return e.duplex; });
+
+    m.def("list_devices", &list_audio_devices,
+        "List the system audio devices as dicts with keys "
+        "index/name/type/is_default.");
 }

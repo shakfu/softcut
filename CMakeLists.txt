@@ -40,13 +40,16 @@ else()
     target_compile_options(_core PRIVATE -Wall -Wextra)
 endif()
 
-# Platform audio backends required by miniaudio.
+# Platform audio backends required by miniaudio. miniaudio runtime-links the
+# backend libraries (ALSA/PulseAudio/JACK, WASAPI/DirectSound/WinMM) via dlopen/
+# LoadLibrary, so no backend dev packages are needed at build time.
 if(APPLE)
     target_link_libraries(_core PRIVATE
         "-framework CoreFoundation"
         "-framework CoreAudio"
         "-framework AudioToolbox")
-    find_library(PTHREAD_LIB pthread)
+elseif(WIN32)
+    target_link_libraries(_core PRIVATE ole32)  # COM, used by the WASAPI backend
 elseif(UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(_core PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)

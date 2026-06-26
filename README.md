@@ -1,5 +1,7 @@
 # softcut
 
+![CI](https://github.com/shakfu/softcut-py/actions/workflows/ci.yml/badge.svg)
+
 Python bindings for [softcut-lib](https://github.com/monome/softcut-lib) — the
 per-voice DSP engine behind monome norns' softcut — with realtime audio I/O via
 [miniaudio](https://github.com/mackron/miniaudio). Built with
@@ -67,6 +69,25 @@ out = eng.render(np.random.randn(48000).astype(np.float32))   # (48000, 2) float
 Load/save audio with whatever you like (e.g. `soundfile`) and assign the array
 to `voice.buffer`.
 
+## Routing and devices
+
+Voices mix to stereo via each voice's `level` and `pan`. `Engine.feedback(src,
+dst, amount)` routes one voice's output into another's input (one block delayed;
+`src == dst` is a self-feedback delay line), and each voice's `input_gain` scales
+the engine's external (mic) input into it:
+
+```python
+eng.feedback(0, 1, 0.4)     # voice 0 -> voice 1 input
+eng[1].input_gain = 0.0     # voice 1 ignores the mic
+```
+
+Pick a specific device by index from `softcut.list_devices()`:
+
+```python
+softcut.list_devices()                      # [{'index':0,'name':...,'type':'playback',...}, ...]
+eng = softcut.Engine(output_device=1, input_device=0)
+```
+
 ## Build and test
 
 ```bash
@@ -78,11 +99,22 @@ make qa       # test + lint + typecheck + format
 Set `SOFTCUT_TEST_AUDIO=1` to additionally exercise a real audio device in the
 test suite. Use `make help` for more targets (wheel, sdist, clean, etc.).
 
+## Releasing
+
+CI runs QA and a Linux/macOS/Windows build smoke on every push and pull request.
+Pushing a `v*` tag builds wheels for CPython 3.10-3.14 across Linux
+(x86_64/aarch64), macOS (x86_64/arm64) and Windows with
+[cibuildwheel](https://cibuildwheel.pypa.io), plus the sdist, and publishes them
+to PyPI via trusted publishing. `make release` bumps the version and creates the
+tag; pushing it triggers the release. (TestPyPI is available via the workflow's
+manual `workflow_dispatch`.)
+
 ## Notes
 
-- Realtime parameter updates from Python are best-effort: softcut parameters are
-  single aligned scalars, so a concurrent read on the audio thread is at worst
-  stale by one block. A lock-free command queue is a possible future hardening.
+- Realtime parameter updates are safe: while the device is running, voice DSP
+  parameter changes from Python are enqueued and applied on the audio thread via
+  a lock-free queue rather than racing it. (The mix scalars `level`/`pan`/
+  `input_gain` and the feedback matrix are plain aligned writes.)
 - The vendored `softcut-lib` carries small host-portability fixes (uninitialized
   members that relied on embedded zero-init static storage, and an oversized
   debug buffer stubbed out); see the comments in `thirdparty/softcut-lib`.
