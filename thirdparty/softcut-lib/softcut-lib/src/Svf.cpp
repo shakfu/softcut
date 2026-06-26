@@ -7,7 +7,20 @@
 
 const float Svf::MAX_NORM_FC = 0.4;
 
-Svf::Svf() = default;
+// Establish self-consistent state at construction. softcut::Voice::reset()
+// calls setRq()/setFc() before setSampleRate(); setFc() clamps the requested
+// corner against minFc/maxFc, and the coefficient math reads pi_sr. If those
+// were left uninitialized the clamp could pin fc to a garbage value that
+// setSampleRate() never re-clamps, yielding unstable coefficients whose state
+// diverges to +/-inf and (via a zeroed output mix) produces NaN. Seeding a
+// valid default sample rate plus fc/rq and zeroing the state avoids that.
+Svf::Svf() {
+    lpMix = hpMix = bpMix = brMix = 0.f;
+    fc = 12000.f;
+    rq = 4.f;
+    clearState();
+    setSampleRate(48000.f);  // sets sr, pi_sr, minFc, maxFc and recomputes coeffs
+}
 
 float Svf::getNextSample(float x) {
     update(x);
