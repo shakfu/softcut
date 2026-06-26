@@ -73,9 +73,18 @@ wheel.exclude = [
 # `cp314-*` glob excludes free-threaded `cp314t` builds on purpose: the realtime
 # command queue is single-producer and relies on the GIL on the Python side.
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
-skip = "*-musllinux_* pp*"
+# PyPy is not enabled by default, so a `pp*` skip selector is a no-op that
+# cibuildwheel warns about; only musllinux needs an explicit skip.
+skip = "*-musllinux_*"
 build-verbosity = 1
 # Install the built wheel and run the suite on each target. numpy arrives via the
 # wheel's own dependency; live-device tests skip without SOFTCUT_TEST_AUDIO.
 test-requires = "pytest"
 test-command = "pytest {project}/tests -q"
+
+[tool.cibuildwheel.macos.environment]
+# nanobind's C++17 code uses aligned new/delete, which is only available with a
+# macOS deployment target of 10.13+. cibuildwheel's x86_64 default (10.9) fails
+# to compile nanobind, so raise it to nanobind's recommended floor. arm64 builds
+# already use a >=11.0 target.
+MACOSX_DEPLOYMENT_TARGET = "10.14"
